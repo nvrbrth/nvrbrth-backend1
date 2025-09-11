@@ -1,221 +1,303 @@
-// server.js
-// NVRBRTH backend — Checkout + Webhooks + Orders + Inventory (minimalistic)
+/**
+ * NVRBRTH backend – Express + Stripe + Resend
+ * Adds /api/checkout using Stripe lookup keys (with empty-cart fallback).
+ */
+require('dotenv').config();
 
-const express = require('express');
-const cors = require('cors');
 const fs = require('fs');
 const path = require('path');
-
-// ⚠️ DO NOT hardcode secrets — use env vars
-const STRIPE_SECRET_KEY = process.env.STRIPE_SECRET_KEY; // set on Render
+const express = require('express');
+const cors = require('cors');
+const bodyParser = require('body-parser');
 const Stripe = require('stripe');
-const stripe = new Stripe(STRIPE_SECRET_KEY, { apiVersion: '2024-06-20' });
+const { Resend } = require('resend');
 
+// ----- Env -----
+const {
+  STRIPE_SECRET_KEY,
+  STRIPE_WEBHOOK_SECRET,
+  RESEND_API_KEY,
+  FROM_EMAIL,
+  ALLOWED_ORIGINS,
+  FRONTEND_BASE_URL,
+  DEFAULT_LOOKUP_KEY
+} = process.env;
+
+if (!STRIPE_SECRET_KEY) console.warn('[warn] STRIPE_SECRET_KEY missing');
+if (!STRIPE_WEBHOOK_SECRET) console.warn('[warn] STRIPE_WEBHOOK_SECRET missing');
+if (!RESEND_API_KEY) console.warn('[warn] RESEND_API_KEY missing');
+if (!FROM_EMAIL) console.warn('[warn] FROM_EMAIL missing');
+if (!FRONTEND_BASE_URL) console.warn('[warn] FRONTEND_BASE_URL missing (used for success/cancel URLs)');
+
+const stripe = new Stripe(STRIPE_SECRET_KEY || '', { apiVersion: '2024-06-20' });
+const resend = new Resend(RESEND_API_KEY || '');
+
+// ----- App -----
 const app = express();
-const PORT = process.env.PORT || 5000;
 
-// ----- Middleware -----
-// CORS: allow your frontend origins
+// CORS
+const allowList = (ALLOWED_ORIGINS || '').split(',').map(s => s.trim()).filter(Boolean);
 app.use(cors({
-  origin: [
-    'https://nvrbrth.store',
-    'http://localhost:3000',
-    'http://127.0.0.1:3000'
-  ],
-  credentials: false
+  origin: (origin, cb) => {
+    if (!origin) return cb(null, true);
+    if (allowList.length === 0 || allowList.includes(origin)) return cb(null, true);
+    return cb(new Error('Not allowed by CORS'), false);
+  }
 }));
+app.options('*', cors()); // preflight
 
-// NOTE: Webhooks need raw body. We add JSON parser AFTER mounting webhook route.
-app.get('/', (_req, res) => res.send('✅ NVRBRTH backend is alive and kicking'));
+// The Stripe webhook must receive the raw body
+app.use('/webhook', express.raw({ type: 'application/json' }));
 
-// ---------- INVENTORY / PRICING (server-side authority) ----------
-// productId -> price/name (unit_amount in pence)
-const PRICE_MAP = {
-  // EXAMPLES — change to your real variants
-  'skinlock_ss_black_s': { name: 'SKINLOCK SS Tee — Black — S', unit_amount: 3500, currency: 'gbp' },
-  'skinlock_ss_black_m': { name: 'SKINLOCK SS Tee — Black — M', unit_amount: 3500, currency: 'gbp' },
-  'skinlock_ss_black_l': { name: 'SKINLOCK SS Tee — Black — L', unit_amount: 3500, currency: 'gbp' },
-  'skinlock_ls_comp_m' : { name: 'SKINLOCK LS Compression — M',  unit_amount: 5200, currency: 'gbp' },
-};
+// JSON for everything else
+app.use(bodyParser.json());
 
-// super simple stock tracker (optional). If you don’t want stock control, remove this.
-const STOCK = {
-  'skinlock_ss_black_s': 10,
-  'skinlock_ss_black_m': 10,
-  'skinlock_ss_black_l': 10,
-  'skinlock_ls_comp_m' : 5,
-};
+// Healthcheck
+app.get('/health', (_req, res) => {
+  res.json({ ok: true });
+});
 
-// helper: clamp quantity and check stock
-function makeLineItems(cart) {
-  if (!Array.isArray(cart) || cart.length === 0) throw new Error('Cart empty');
-  return cart.map(({ productId, quantity }) => {
-    const p = PRICE_MAP[productId];
-    if (!p) throw new Error(`Unknown productId: ${productId}`);
-    const q = Math.max(1, Math.min(Number(quantity) || 1, 10));
-    if (STOCK[productId] !== undefined && STOCK[productId] <= 0) {
-      throw new Error(`Out of stock: ${productId}`);
-    }
-    return {
-      price_data: {
-        currency: p.currency,
-        product_data: { name: p.name },
-        unit_amount: p.unit_amount,
-      },
-      quantity: q,
-    };
-  });
+// ---- Email template loader (optional) ----
+const TEMPLATE_PATH = path.join(__dirname, 'email.html');
+let EMAIL_TEMPLATE = null;
+try {
+  EMAIL_TEMPLATE = fs.readFileSync(TEMPLATE_PATH, 'utf8');
+  console.log('[init] Loaded email template:', TEMPLATE_PATH);
+} catch (e) {
+  console.warn('[warn] email.html not found – will send a simplified email body');
 }
 
-// ---------- WEBHOOK (MOUNT BEFORE JSON PARSER) ----------
-const WEBHOOK_PATH = '/webhooks/stripe';
-app.post(WEBHOOK_PATH, express.raw({ type: 'application/json' }), async (req, res) => {
-  const sig = req.headers['stripe-signature'];
-  const endpointSecret = process.env.STRIPE_WEBHOOK_SECRET; // set from Stripe Dashboard/CLI
+async function sendOrderEmail({ to, orderId, amountTotal, currency, lineItems = [], created }) {
+  if (!RESEND_API_KEY || !FROM_EMAIL || !to) {
+    console.warn('[email] Missing keys or recipient; skipping email send');
+    return;
+  }
 
-  let event;
+  const fmtCurrency = (amt, curr) => {
+    try {
+      return new Intl.NumberFormat('en-GB', { style: 'currency', currency: (curr || 'GBP').toUpperCase() }).format((amt || 0) / 100);
+    } catch {
+      return `£${((amt || 0) / 100).toFixed(2)}`;
+    }
+  };
+
+  let html = EMAIL_TEMPLATE;
+  if (html) {
+    const dateStr = created ? new Date(created * 1000).toLocaleString('en-GB', { timeZone: 'Europe/London' }) : new Date().toLocaleString('en-GB');
+    const rows = (lineItems || []).map(li => {
+      const qty = li.quantity || 1;
+      const name = li.description || li.price?.product || 'Item';
+      const price = fmtCurrency(li.amount_subtotal ?? (li.price?.unit_amount || 0) * qty, currency);
+      return `<tr><td style="padding:6px 0">${name}${li.size ? ` — ${li.size}` : ''}</td><td style="text-align:right">${qty} × ${fmtCurrency(li.price?.unit_amount || 0, currency)}</td><td style="text-align:right">${price}</td></tr>`;
+    }).join('');
+
+    html = html
+      .replace(/{{ORDER_ID}}/g, orderId || 'N/A')
+      .replace(/{{ORDER_DATE}}/g, dateStr)
+      .replace(/{{ITEM_ROWS}}/g, rows || '')
+      .replace(/{{TOTAL}}/g, fmtCurrency(amountTotal || 0, currency))
+      .replace(/{{SUBTOTAL}}/g, '')
+      .replace(/{{DISCOUNT_ROW}}/g, '')
+      .replace(/{{SHIPPING_ROW}}/g, '')
+      .replace(/{{TAX_ROW}}/g, '')
+      .replace(/{{SHIPPING_BLOCK}}/g, '');
+  } else {
+    html = `<div style="font-family:Arial,sans-serif;padding:16px">
+      <h2>Order confirmed</h2>
+      <p>Thanks for your order ${orderId ? `(${orderId})` : ''}.</p>
+      <p>Total: ${fmtCurrency(amountTotal || 0, currency)}</p>
+      <p>You'll receive another email when it ships (pre‑order ~1 month).</p>
+    </div>`;
+  }
+
   try {
-    event = stripe.webhooks.constructEvent(req.body, sig, endpointSecret);
+    const res = await resend.emails.send({
+      from: FROM_EMAIL,
+      to,
+      subject: 'NVRBRTH — Order Confirmation',
+      html
+    });
+    console.log('[email] Sent:', res?.id || 'ok');
   } catch (err) {
-    console.error('❌ Webhook signature verification failed:', err.message);
+    console.error('[email] Failed:', err?.message || err);
+  }
+}
+
+// ------------------------------
+// Checkout via lookup keys
+// ------------------------------
+
+/** Optional explicit mapping: slug -> lookup_key (leave empty if slugs already equal to lookup keys) */
+const SLUG_TO_LOOKUP = {
+  // 'vein-001': 'lk_vein_001',
+  // 'skinlock-exe': 'lk_skinlock_exe',
+};
+
+/** Normalize a cart item from the frontend into a lookup key */
+function itemToLookupKey(raw) {
+  const base = String(raw.productId || raw.base || '')
+    .toLowerCase()
+    .replace(/_/g, '-');
+  return SLUG_TO_LOOKUP[base] || base;
+}
+
+/** Resolve multiple lookup keys into Stripe Price IDs */
+async function resolvePrices(lookupKeys) {
+  const uniq = [...new Set(lookupKeys)];
+  if (!uniq.length) return new Map();
+  const prices = await stripe.prices.list({
+    lookup_keys: uniq,
+    active: true,
+    limit: Math.max(uniq.length, 10),
+    expand: ['data.product']
+  });
+  const map = new Map();
+  for (const p of prices.data) {
+    if (p.lookup_key) map.set(p.lookup_key, p.id);
+  }
+  return map;
+}
+
+app.post('/api/checkout', async (req, res) => {
+  try {
+    const {
+      email, name, phone,
+      address1, city, postcode, country = 'GB',
+      cart = []
+    } = req.body || {};
+
+    // support your old "empty cart goes to test item" workflow
+    const usingFallback = !Array.isArray(cart) || cart.length === 0;
+    const wantedLookupKeys = usingFallback
+      ? [ (DEFAULT_LOOKUP_KEY || 'nvrbrth-test-item') ]
+      : cart.map(itemToLookupKey);
+
+    const priceMap = await resolvePrices(wantedLookupKeys);
+
+    const itemsForSession = (usingFallback ? [{ quantity: 1, productId: wantedLookupKeys[0] }] : cart).map(raw => {
+      const lk = itemToLookupKey(raw);
+      const price = priceMap.get(lk);
+      if (!price) {
+        throw new Error(`NO_PRICE_FOR_LOOKUP_KEY_${lk}`);
+      }
+      const qty = Math.max(1, parseInt(raw.quantity || 1, 10));
+      return { price, quantity: qty };
+    });
+
+    const success = `${FRONTEND_BASE_URL || ''}/thankyou.html?sid={CHECKOUT_SESSION_ID}`.replace(/\/\//g,'/').replace('https:/','https://');
+    const cancel  = `${FRONTEND_BASE_URL || ''}/checkout.html`.replace(/\/\//g,'/').replace('https:/','https://');
+
+    const session = await stripe.checkout.sessions.create({
+      mode: 'payment',
+      line_items: itemsForSession,
+      allow_promotion_codes: true,
+      customer_email: email || undefined,
+      shipping_address_collection: { allowed_countries: ['GB'] },
+      success_url: success,
+      cancel_url: cancel,
+      metadata: {
+        name: name || '',
+        phone: phone || '',
+        address1: address1 || '',
+        city: city || '',
+        postcode: postcode || '',
+        country: country || 'GB'
+      }
+    });
+
+    return res.json({ url: session.url, id: session.id });
+  } catch (err) {
+    console.error('[checkout] error:', err?.message || err);
+    return res.status(400).json({ error: 'CHECKOUT_CREATE_FAILED' });
+  }
+});
+
+// Optional helper: /session/:id -> redirect to Checkout (handy if frontend only gets an id)
+app.get('/session/:id', async (req, res) => {
+  try {
+    const s = await stripe.checkout.sessions.retrieve(req.params.id);
+    if (s && s.url) return res.redirect(s.url);
+    return res.status(404).send('Session not found');
+  } catch (e) {
+    return res.status(400).send('Invalid session');
+  }
+});
+
+// ---- Webhook ----
+app.post('/webhook', async (req, res) => {
+  const sig = req.headers['stripe-signature'];
+  let event;
+
+  try {
+    event = stripe.webhooks.constructEvent(req.body, sig, STRIPE_WEBHOOK_SECRET || '');
+  } catch (err) {
+    console.error('[webhook] signature verification failed:', err.message);
     return res.status(400).send(`Webhook Error: ${err.message}`);
   }
 
   try {
-    if (event.type === 'checkout.session.completed') {
-      const session = event.data.object;
+    switch (event.type) {
+      case 'checkout.session.completed': {
+        const session = event.data.object;
+        console.log('✅ checkout.session.completed', session.id);
 
-      // fetch line items to save detailed order (descriptions/prices)
-      const items = await stripe.checkout.sessions.listLineItems(session.id, { limit: 100 });
+        // Pull details to email customer
+        const customerEmail = session.customer_details?.email || session.customer_email;
+        const amountTotal = session.amount_total;
+        const currency = session.currency;
 
-      // decrement stock (best-effort)
-      try {
-        items.data.forEach(li => {
-          // Find productId from our metadata cart if present
-          // We stored cart JSON in session.metadata.cart
-          // If not present, do a best-effort name match (not ideal)
-        });
-        // If you stored cart in metadata (we do below), use it to decrement precisely:
-        if (session.metadata?.cart) {
-          const cart = JSON.parse(session.metadata.cart);
-          cart.forEach(({ productId, quantity }) => {
-            if (STOCK[productId] !== undefined) {
-              STOCK[productId] = Math.max(0, STOCK[productId] - (Number(quantity) || 1));
-            }
-          });
+        // Optionally fetch line items (requires expand or separate API call)
+        let lineItems = [];
+        try {
+          const items = await stripe.checkout.sessions.listLineItems(session.id, { limit: 100 });
+          lineItems = items.data || [];
+        } catch (e) {
+          console.warn('[webhook] listLineItems failed:', e.message);
         }
-      } catch (e) {
-        console.warn('⚠️ Stock decrement issue:', e.message);
+
+        await sendOrderEmail({
+          to: customerEmail,
+          orderId: session.id,
+          amountTotal,
+          currency,
+          lineItems,
+          created: session.created
+        });
+
+        break;
       }
 
-      const record = {
-        id: session.id,
-        payment_status: session.payment_status,
-        amount_total: session.amount_total,
-        currency: session.currency,
-        customer_email: session.customer_details?.email || session.customer_email,
-        shipping: session.shipping_details || null,
-        metadata: session.metadata || {},
-        line_items: items.data.map(i => ({
-          description: i.description,
-          quantity: i.quantity,
-          amount_subtotal: i.amount_subtotal,
-          amount_total: i.amount_total
-        })),
-        created: Date.now()
-      };
+      case 'payment_intent.succeeded': {
+        const intent = event.data.object;
+        console.log('💰 payment_intent.succeeded', intent.id, intent.amount);
+        break;
+      }
 
-      fs.appendFileSync(path.join(process.cwd(), 'orders.json'), JSON.stringify(record) + '\n');
-      console.log('✅ Order saved:', record.id);
+      case 'payment_intent.payment_failed': {
+        const intent = event.data.object;
+        console.warn('❌ payment_intent.payment_failed', intent.id, intent.last_payment_error?.message);
+        break;
+      }
+
+      case 'charge.refunded': {
+        const charge = event.data.object;
+        console.log('↩️ charge.refunded', charge.id, charge.amount_refunded);
+        break;
+      }
+
+      default:
+        break;
     }
 
     res.json({ received: true });
   } catch (err) {
-    console.error('❌ Webhook handler error:', err);
-    res.status(500).send('Webhook handler error');
+    console.error('[webhook] handler error:', err);
+    res.status(500).json({ ok: false });
   }
 });
 
-// ---------- JSON PARSER AFTER WEBHOOK ----------
-app.use(express.json());
-
-// ---------- CHECKOUT (dynamic from cart) ----------
-app.post('/api/checkout', async (req, res) => {
-  try {
-    const { cart, customer_email } = req.body;
-
-    const line_items = makeLineItems(cart);
-
-    const session = await stripe.checkout.sessions.create({
-      mode: 'payment',
-      payment_method_types: ['card'],
-      customer_email,
-      line_items,
-      shipping_address_collection: { allowed_countries: ['GB','IE','US','CA','AU','NZ','DE','FR','ES','IT','NL','SE'] },
-      allow_promotion_codes: true,
-      success_url: 'https://nvrbrth.store/thankyou.html?session_id={CHECKOUT_SESSION_ID}',
-      cancel_url: 'https://nvrbrth.store/basket.html?canceled=1',
-      // keep a compact copy of the original cart to reconcile later
-      metadata: { cart: JSON.stringify(cart || []) },
-    });
-
-    res.json({ url: session.url });
-  } catch (err) {
-    console.error('checkout error:', err.message);
-    res.status(400).json({ error: err.message || 'Failed to create session' });
-  }
-});
-
-// ---------- SINGLE-ITEM CHECKOUT (legacy demo; keep if you want) ----------
-app.post('/api/create-checkout-session', async (_req, res) => {
-  try {
-    const session = await stripe.checkout.sessions.create({
-      mode: 'payment',
-      payment_method_types: ['card'],
-      line_items: [{
-        price_data: {
-          currency: 'gbp',
-          product_data: { name: 'HOST_001 Tee' },
-          unit_amount: 3500,
-        },
-        quantity: 1,
-      }],
-      success_url: 'https://nvrbrth.store/thankyou.html?session_id={CHECKOUT_SESSION_ID}',
-      cancel_url: 'https://nvrbrth.store/basket.html',
-    });
-    res.json({ url: session.url });
-  } catch (error) {
-    console.error('❌ Stripe error:', error);
-    res.status(500).json({ error: 'Stripe session creation failed' });
-  }
-});
-
-// ---------- ORDER SUMMARY (for thank-you page) ----------
-app.get('/api/order-summary/:sessionId', async (req, res) => {
-  try {
-    const sessionId = req.params.sessionId;
-    const session = await stripe.checkout.sessions.retrieve(sessionId, { expand: ['line_items'] });
-    res.json({
-      id: session.id,
-      status: session.payment_status,
-      email: session.customer_details?.email || session.customer_email,
-      amount_total: session.amount_total,
-      currency: session.currency,
-      shipping: session.shipping_details || null,
-      line_items: (session.line_items?.data || []).map(i => ({
-        description: i.description, quantity: i.quantity, amount_total: i.amount_total
-      }))
-    });
-  } catch (e) {
-    res.status(404).json({ error: 'Order not found' });
-  }
-});
-
-// ---------- DEV HELPERS ----------
-app.get('/api/stock', (_req, res) => res.json(STOCK));
-app.get('/api/prices', (_req, res) => res.json(PRICE_MAP));
-
-// ---------- START ----------
+// ----- Start -----
+const PORT = process.env.PORT || 8787;
 app.listen(PORT, () => {
-  console.log(`🚀 Server running on port ${PORT}`);
+  console.log(`NVRBRTH server running on ${PORT}`);
 });

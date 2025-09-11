@@ -1,0 +1,53 @@
+# ─────────────────────────────
+# Core (REQUIRED)
+# ─────────────────────────────
+NODE_ENV=production
+PORT=8787
+
+# Stripe
+STRIPE_SECRET_KEY=
+STRIPE_WEBHOOK_SECRET=    
+
+# Admin
+ADMIN_KEY=         
+# ─────────────────────────────
+# Email (order confirmations, alerts)
+# ─────────────────────────────
+FROM_EMAIL=orders@nvrbrth.store
+RESEND_API_KEY=
+OWNER_EMAIL=support@nvrbrth.store.com             
+
+# ─────────────────────────────
+# Pricing & Shipping UX
+# ─────────────────────────────
+FREE_SHIPPING_GBP=6000                     # pence; 6000 = £60 free shipping threshold (0 to disable)
+LOW_STOCK_THRESHOLD=5                      # alert when an item stock <= this (0 to disable)
+
+# ─────────────────────────────
+# Server-side Pixels (optional)
+
+# ─────────────────────────────
+# EasyPost (auto-buy shipping labels) — optional
+# ─────────────────────────────
+EASYPOST_API_KEY=
+
+# Ship-from address (used for labels)
+SHIP_FROM_NAME=NVRBRTH
+SHIP_FROM_LINE1=17 oakley road
+SHIP_FROM_CITY=Sheffield
+SHIP_FROM_POSTCODE=S13 9AF
+SHIP_FROM_COUNTRY=UNITED KINGDOM
+
+# ─────────────────────────────
+# Backups to S3 (02:15 Europe/London) — optional
+# ───────────────────────────── 
+
+# ─────────────────────────────
+# Ops/Dev Quality-of-life (optional)
+# ─────────────────────────────
+DISCORD_WEBHOOK_URL=https://discord.com/api/webhooks/REPLACE_ME
+
+# Frontend URLs
+FRONTEND_BASE_URL=https://nvrbrth.store
+ALLOWED_ORIGINS=https://nvrbrth.store,https://*.netlify.app,http://localhost:5173,http://localhost:3000
+DEFAULT_LOOKUP_KEY=nvrbrth-test-item

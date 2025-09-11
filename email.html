@@ -1,0 +1,87 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="UTF-8" />
+  <title>NVRBRTH — Order Confirmed</title>
+  <meta name="color-scheme" content="dark light">
+  <style>
+    /* Layout */
+    body{margin:0;padding:0;background:#0a0a0a;color:#c7bda3;font-family:'Share Tech Mono',monospace;}
+    .wrap{max-width:720px;margin:0 auto;padding:24px 18px;}
+    h1{margin:0 0 12px;color:#ff2a2a;font-size:22px;letter-spacing:.12em}
+    p{margin:0 0 10px;line-height:1.65}
+    .muted{opacity:.8;font-size:12px}
+    .panel{background:#0e0e0e;border:1px solid rgba(199,189,163,.25);border-radius:10px;padding:16px}
+    .divider{height:1px;background:linear-gradient(90deg,rgba(255,42,42,.0),rgba(255,42,42,.6),rgba(255,42,42,.0));margin:16px 0}
+    .tag{display:inline-block;border:1px solid rgba(199,189,163,.35);border-radius:8px;padding:6px 10px;color:#fff;background:#000}
+    a{color:#ff2a2a;text-decoration:none}
+
+    /* Items table */
+    table{width:100%;border-collapse:collapse}
+    th,td{padding:10px 8px;border-bottom:1px solid rgba(199,189,163,.18);vertical-align:top}
+    th{color:#ff2a2a;text-align:left;font-weight:600;font-size:13px}
+    td{font-size:14px}
+    .num{text-align:right;white-space:nowrap}
+    .name{color:#fff}
+    .size{opacity:.85}
+
+    /* Totals */
+    .totals td{border:0;padding:6px 8px}
+    .totals .label{opacity:.9}
+    .totals .grand{font-weight:700;color:#fff;border-top:1px dashed rgba(255,42,42,.5);padding-top:10px}
+
+    /* Address */
+    .address{white-space:pre-line}
+
+    /* Footer */
+    .foot{margin-top:18px;font-size:12px;opacity:.75;line-height:1.6}
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <h1>ORDER CONFIRMED</h1>
+    <p class="muted">
+      Order <span class="tag">#{{ORDER_ID}}</span> · <span>{{ORDER_DATE}}</span>
+    </p>
+
+    <div class="divider"></div>
+
+    <!-- Items -->
+    <div class="panel">
+      <p style="margin-bottom:12px">You ordered:</p>
+      <table role="presentation" aria-hidden="true">
+        <thead>
+          <tr>
+            <th>Item</th>
+            <th class="num">Qty</th>
+            <th class="num">Price</th>
+            <th class="num">Line</th>
+          </tr>
+        </thead>
+        <tbody>
+          {{ITEM_ROWS}}
+        </tbody>
+      </table>
+    </div>
+
+    <!-- Totals -->
+    <table class="totals" role="presentation" style="width:100%;margin-top:10px">
+      <tr><td class="label">Merch Subtotal</td><td class="num">{{SUBTOTAL}}</td></tr>
+      {{DISCOUNT_ROW}}
+      {{SHIPPING_ROW}}
+      {{TAX_ROW}}
+      <tr><td class="grand">Total Paid</td><td class="num grand">{{TOTAL}}</td></tr>
+    </table>
+
+    <div class="divider"></div>
+
+    <!-- Shipping block (shown if present) -->
+    {{SHIPPING_BLOCK}}
+
+    <div class="foot">
+      [ WARNING ] THIS BODY IS NO LONGER ISOLATED — Mutation rate escalating.<br/>
+      Questions? Reply to this email. Follow: <a href="https://www.instagram.com/adamlinleyy/">Instagram</a> · <a href="https://www.tiktok.com/@nvrbrth">TikTok</a>
+    </div>
+  </div>
+</body>
+</html>
