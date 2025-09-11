@@ -49,5 +49,4 @@ DISCORD_WEBHOOK_URL=https://discord.com/api/webhooks/REPLACE_ME
 
 # Frontend URLs
 FRONTEND_BASE_URL=https://nvrbrth.store
-ALLOWED_ORIGINS=https://nvrbrth.store,https://*.netlify.app,http://localhost:5173,http://localhost:3000
-DEFAULT_LOOKUP_KEY=nvrbrth-test-item
+ALLOWED_ORIGINS=https://nvrbrth.store,http://localhost:5173,http://localhost:3000

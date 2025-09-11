@@ -39,6 +39,7 @@ const app = express();
 const allowList = (ALLOWED_ORIGINS || '').split(',').map(s => s.trim()).filter(Boolean);
 app.use(cors({
   origin: (origin, cb) => {
+    console.log('[cors] origin:', origin);
     if (!origin) return cb(null, true);
     if (allowList.length === 0 || allowList.includes(origin)) return cb(null, true);
     return cb(new Error('Not allowed by CORS'), false);
@@ -166,12 +167,16 @@ app.post('/api/checkout', async (req, res) => {
       cart = []
     } = req.body || {};
 
-    // support your old "empty cart goes to test item" workflow
-    const usingFallback = !Array.isArray(cart) || cart.length === 0;
-    const wantedLookupKeys = usingFallback
-      ? [ (DEFAULT_LOOKUP_KEY || 'nvrbrth-test-item') ]
-      : cart.map(itemToLookupKey);
+    // require a non-empty cart
+    if (!Array.isArray(cart) || cart.length === 0) {
+      console.warn('[checkout] EMPTY_CART');
+      return res.status(400).json({ error: 'EMPTY_CART' });
+    }
 
+    console.log('[checkout] origin:', req.headers.origin);
+    console.log('[checkout] body:', req.body);
+
+    const wantedLookupKeys = cart.map(itemToLookupKey);
     const priceMap = await resolvePrices(wantedLookupKeys);
 
     const itemsForSession = (usingFallback ? [{ quantity: 1, productId: wantedLookupKeys[0] }] : cart).map(raw => {
@@ -208,7 +213,7 @@ app.post('/api/checkout', async (req, res) => {
     return res.json({ url: session.url, id: session.id });
   } catch (err) {
     console.error('[checkout] error:', err?.message || err);
-    return res.status(400).json({ error: 'CHECKOUT_CREATE_FAILED' });
+    return res.status(400).json({ error: err?.message || 'CHECKOUT_CREATE_FAILED' });
   }
 });
 
