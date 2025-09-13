@@ -136,11 +136,12 @@ const SLUG_TO_LOOKUP = {
 
 /** Normalize a cart item from the frontend into a lookup key */
 function itemToLookupKey(raw) {
-  const base = String(raw.productId || raw.base || '')
-    .toLowerCase()
-    .replace(/_/g, '-');
+  const product = String(raw.productId || raw.base || '').toLowerCase();
+  const baseOnly = product.split('_')[0]; // drop size suffix e.g. vein-001_small -> vein-001
+  const base = baseOnly.replace(/_/g, '-');
   return SLUG_TO_LOOKUP[base] || base;
 }
+
 
 /** Resolve multiple lookup keys into Stripe Price IDs */
 async function resolvePrices(lookupKeys) {
@@ -179,7 +180,7 @@ app.post('/api/checkout', async (req, res) => {
     const wantedLookupKeys = cart.map(itemToLookupKey);
     const priceMap = await resolvePrices(wantedLookupKeys);
 
-    const itemsForSession = (usingFallback ? [{ quantity: 1, productId: wantedLookupKeys[0] }] : cart).map(raw => {
+    const itemsForSession = cart.map(raw => {
       const lk = itemToLookupKey(raw);
       const price = priceMap.get(lk);
       if (!price) {
@@ -214,6 +215,43 @@ app.post('/api/checkout', async (req, res) => {
   } catch (err) {
     console.error('[checkout] error:', err?.message || err);
     return res.status(400).json({ error: err?.message || 'CHECKOUT_CREATE_FAILED' });
+  }
+});
+
+// Lightweight order fetch for thankyou.html
+app.get('/api/orders/:id', async (req, res) => {
+  try {
+    const id = req.params.id;
+    const session = await stripe.checkout.sessions.retrieve(id);
+    const lineItems = await stripe.checkout.sessions.listLineItems(id, {
+      expand: ['data.price.product']
+    });
+
+    const lines = (lineItems.data || []).map(li => ({
+      quantity: li.quantity || 1,
+      amount_subtotal: li.amount_subtotal || 0,
+      amount_total: li.amount_total || 0,
+      currency: (li.currency || session.currency || 'gbp').toLowerCase(),
+      name: (li.price?.product?.name) || li.description || '',
+      size: (li.price?.nickname) || '', // optional: price nickname as size/variant
+      price: {
+        unit_amount: li.price?.unit_amount || 0,
+        currency: (li.price?.currency || session.currency || 'gbp').toLowerCase()
+      }
+    }));
+
+    return res.json({
+      id: session.id,
+      status: session.payment_status || session.status || 'created',
+      amount_total: session.amount_total || 0,
+      currency: (session.currency || 'gbp').toLowerCase(),
+      created: session.created,
+      email: session.customer_details?.email || '',
+      pricing: { lines }
+    });
+  } catch (e) {
+    console.error('[orders] fetch failed:', e?.message || e);
+    return res.status(400).json({ error: 'ORDER_LOOKUP_FAILED' });
   }
 });
 
