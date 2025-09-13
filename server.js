@@ -35,6 +35,10 @@ const resend = new Resend(RESEND_API_KEY || '');
 // ----- App -----
 const app = express();
 
+
+const DEBUG = process.env.DEBUG === 'true' || process.env.debug === 'true';
+app.use((req, _res, next) => { if (DEBUG) console.log(`[req] ${req.method} ${req.originalUrl} origin=${req.get('origin')||''}`); next(); });
+app.get('/ping', (_req, res) => res.json({ ok: true }));
 // CORS
 const allowList = (ALLOWED_ORIGINS || '').split(',').map(s => s.trim()).filter(Boolean);
 app.use(cors({
@@ -161,6 +165,11 @@ async function resolvePrices(lookupKeys) {
 }
 
 app.post('/api/checkout', async (req, res) => {
+  if (DEBUG) {
+    try { const keys = Object.keys(req.body || {}); console.log('[checkout] body keys:', keys);
+      const c = req.body && req.body.cart || []; console.log('[checkout] cart length:', c.length);
+      console.log('[checkout] origin:', req.get('origin') || ''); } catch {}
+  }
   try {
     const {
       email, name, phone,
@@ -195,6 +204,7 @@ app.post('/api/checkout', async (req, res) => {
 
     const session = await stripe.checkout.sessions.create({
       mode: 'payment',
+      if (DEBUG) console.log('[checkout] line_items:', JSON.stringify(itemsForSession));
       line_items: itemsForSession,
       allow_promotion_codes: true,
       customer_email: email || undefined,
