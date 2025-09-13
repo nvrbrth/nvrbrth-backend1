@@ -164,7 +164,7 @@ async function resolvePrices(lookupKeys) {
   return map;
 }
 
-app.post('/api/checkout', async (req, res) => {
+app.post(['/api/checkout','/checkout','/create-checkout-session'], async (req, res) => {
   if (DEBUG) {
     try { const keys = Object.keys(req.body || {}); console.log('[checkout] body keys:', keys);
       const c = req.body && req.body.cart || []; console.log('[checkout] cart length:', c.length);
