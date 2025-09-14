@@ -1,24 +1,17 @@
 {
   "name": "nvrbrth-backend",
   "version": "1.0.0",
+  "private": true,
+  "main": "server.js",
   "scripts": {
     "start": "node server.js"
   },
   "dependencies": {
+    "body-parser": "^1.20.2",
     "cors": "^2.8.5",
-    "dotenv": "^17.2.2",
-    "express": "^5.1.0",
-    "express-rate-limit": "^8.1.0",
-    "helmet": "^8.1.0",
-    "stripe": "^18.5.0",
-    "resend": "^3.4.0",
-    "body-parser": "^2.2.0"
+    "express": "^4.19.2",
+    "stripe": "^16.4.0"
   },
-  "main": "server.js",
-  "keywords": [],
-  "author": "",
-  "license": "ISC",
-  "description": "",
   "engines": {
     "node": ">=18"
   }
