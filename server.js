@@ -1,356 +1,176 @@
 /**
- * NVRBRTH backend – Express + Stripe + Resend
- * Adds /api/checkout using Stripe lookup keys (with empty-cart fallback).
+ * NVRBRTH minimal production-ready backend for Stripe Checkout (CommonJS).
+ * - CORS allow-list via ALLOWED_ORIGINS (comma-separated, no trailing slashes)
+ * - POST /create-checkout-session resolves Stripe prices by price id OR lookup_key
+ * - POST /webhook uses raw body for signature verification
+ * - GET  /ping healthcheck
  */
-require('dotenv').config();
+const express = require("express");
+const cors = require("cors");
+const Stripe = require("stripe");
+const bodyParser = require("body-parser");
 
-const fs = require('fs');
-const path = require('path');
-const express = require('express');
-const cors = require('cors');
-const bodyParser = require('body-parser');
-const Stripe = require('stripe');
-const { Resend } = require('resend');
+const app = express();
 
-// ----- Env -----
+// ---- ENV (configure on Render) ----
+// STRIPE_SECRET_KEY=sk_live_...
+// STRIPE_WEBHOOK_SECRET=whsec_...
+// ALLOWED_ORIGINS=https://nvrbrth.store,https://legendary-sunflower-10d7b9.netlify.app,http://localhost:5173,http://localhost:3000
+// FRONTEND_BASE_URL=https://nvrbrth.store
+// PORT=<render provided>
 const {
   STRIPE_SECRET_KEY,
   STRIPE_WEBHOOK_SECRET,
-  RESEND_API_KEY,
-  FROM_EMAIL,
-  ALLOWED_ORIGINS,
-  FRONTEND_BASE_URL,
-  DEFAULT_LOOKUP_KEY
+  ALLOWED_ORIGINS = "",
+  FRONTEND_BASE_URL = "",
 } = process.env;
 
-if (!STRIPE_SECRET_KEY) console.warn('[warn] STRIPE_SECRET_KEY missing');
-if (!STRIPE_WEBHOOK_SECRET) console.warn('[warn] STRIPE_WEBHOOK_SECRET missing');
-if (!RESEND_API_KEY) console.warn('[warn] RESEND_API_KEY missing');
-if (!FROM_EMAIL) console.warn('[warn] FROM_EMAIL missing');
-if (!FRONTEND_BASE_URL) console.warn('[warn] FRONTEND_BASE_URL missing (used for success/cancel URLs)');
+if (!STRIPE_SECRET_KEY) {
+  console.warn("WARNING: STRIPE_SECRET_KEY is not set. Set it in Render env vars.");
+}
+const stripe = new Stripe(STRIPE_SECRET_KEY || "", { apiVersion: "2024-06-20" });
 
-const stripe = new Stripe(STRIPE_SECRET_KEY || '', { apiVersion: '2024-06-20' });
-const resend = new Resend(RESEND_API_KEY || '');
-
-// ----- App -----
-const app = express();
-
-
-const DEBUG = process.env.DEBUG === 'true' || process.env.debug === 'true';
-app.use((req, _res, next) => { if (DEBUG) console.log(`[req] ${req.method} ${req.originalUrl} origin=${req.get('origin')||''}`); next(); });
-app.get('/ping', (_req, res) => res.json({ ok: true }));
-// CORS
-const allowList = (ALLOWED_ORIGINS || '').split(',').map(s => s.trim()).filter(Boolean);
+// --- CORS allow list ---
+const origins = ALLOWED_ORIGINS.split(",").map(s => s.trim()).filter(Boolean);
+function applyCorsHeaders(req, res) {
+  const origin = req.headers.origin;
+  if (origin && origins.includes(origin)) {
+    res.header("Access-Control-Allow-Origin", origin);
+    res.header("Vary", "Origin");
+    res.header("Access-Control-Allow-Credentials", "true");
+    res.header("Access-Control-Allow-Headers", "Content-Type, Authorization");
+    res.header("Access-Control-Allow-Methods", "GET,POST,OPTIONS");
+  }
+}
+// Handle preflight quickly
+app.use((req, res, next) => {
+  if (req.method === "OPTIONS") {
+    applyCorsHeaders(req, res);
+    return res.sendStatus(204);
+  }
+  applyCorsHeaders(req, res);
+  next();
+});
 app.use(cors({
   origin: (origin, cb) => {
-    console.log('[cors] origin:', origin);
-    if (!origin) return cb(null, true);
-    if (allowList.length === 0 || allowList.includes(origin)) return cb(null, true);
-    return cb(new Error('Not allowed by CORS'), false);
-  }
+    if (!origin) return cb(null, true); // allow curl/postman
+    return cb(null, origins.includes(origin));
+  },
+  credentials: true,
 }));
-app.options('*', cors()); // preflight
-
-// The Stripe webhook must receive the raw body
-app.use('/webhook', express.raw({ type: 'application/json' }));
-
-// JSON for everything else
-app.use(bodyParser.json());
 
 // Healthcheck
-app.get('/health', (_req, res) => {
-  res.json({ ok: true });
-});
+app.get("/ping", (_req, res) => res.json({ ok: true }));
 
-// ---- Email template loader (optional) ----
-const TEMPLATE_PATH = path.join(__dirname, 'email.html');
-let EMAIL_TEMPLATE = null;
-try {
-  EMAIL_TEMPLATE = fs.readFileSync(TEMPLATE_PATH, 'utf8');
-  console.log('[init] Loaded email template:', TEMPLATE_PATH);
-} catch (e) {
-  console.warn('[warn] email.html not found – will send a simplified email body');
-}
-
-async function sendOrderEmail({ to, orderId, amountTotal, currency, lineItems = [], created }) {
-  if (!RESEND_API_KEY || !FROM_EMAIL || !to) {
-    console.warn('[email] Missing keys or recipient; skipping email send');
-    return;
-  }
-
-  const fmtCurrency = (amt, curr) => {
-    try {
-      return new Intl.NumberFormat('en-GB', { style: 'currency', currency: (curr || 'GBP').toUpperCase() }).format((amt || 0) / 100);
-    } catch {
-      return `£${((amt || 0) / 100).toFixed(2)}`;
-    }
-  };
-
-  let html = EMAIL_TEMPLATE;
-  if (html) {
-    const dateStr = created ? new Date(created * 1000).toLocaleString('en-GB', { timeZone: 'Europe/London' }) : new Date().toLocaleString('en-GB');
-    const rows = (lineItems || []).map(li => {
-      const qty = li.quantity || 1;
-      const name = li.description || li.price?.product || 'Item';
-      const price = fmtCurrency(li.amount_subtotal ?? (li.price?.unit_amount || 0) * qty, currency);
-      return `<tr><td style="padding:6px 0">${name}${li.size ? ` — ${li.size}` : ''}</td><td style="text-align:right">${qty} × ${fmtCurrency(li.price?.unit_amount || 0, currency)}</td><td style="text-align:right">${price}</td></tr>`;
-    }).join('');
-
-    html = html
-      .replace(/{{ORDER_ID}}/g, orderId || 'N/A')
-      .replace(/{{ORDER_DATE}}/g, dateStr)
-      .replace(/{{ITEM_ROWS}}/g, rows || '')
-      .replace(/{{TOTAL}}/g, fmtCurrency(amountTotal || 0, currency))
-      .replace(/{{SUBTOTAL}}/g, '')
-      .replace(/{{DISCOUNT_ROW}}/g, '')
-      .replace(/{{SHIPPING_ROW}}/g, '')
-      .replace(/{{TAX_ROW}}/g, '')
-      .replace(/{{SHIPPING_BLOCK}}/g, '');
-  } else {
-    html = `<div style="font-family:Arial,sans-serif;padding:16px">
-      <h2>Order confirmed</h2>
-      <p>Thanks for your order ${orderId ? `(${orderId})` : ''}.</p>
-      <p>Total: ${fmtCurrency(amountTotal || 0, currency)}</p>
-      <p>You'll receive another email when it ships (pre‑order ~1 month).</p>
-    </div>`;
-  }
-
-  try {
-    const res = await resend.emails.send({
-      from: FROM_EMAIL,
-      to,
-      subject: 'NVRBRTH — Order Confirmation',
-      html
-    });
-    console.log('[email] Sent:', res?.id || 'ok');
-  } catch (err) {
-    console.error('[email] Failed:', err?.message || err);
-  }
-}
-
-// ------------------------------
-// Checkout via lookup keys
-// ------------------------------
-
-/** Optional explicit mapping: slug -> lookup_key (leave empty if slugs already equal to lookup keys) */
-const SLUG_TO_LOOKUP = {
-  // 'vein-001': 'lk_vein_001',
-  // 'skinlock-exe': 'lk_skinlock_exe',
-};
-
-/** Normalize a cart item from the frontend into a lookup key */
-function itemToLookupKey(raw) {
-  const product = String(raw.productId || raw.base || '').toLowerCase();
-  const baseOnly = product.split('_')[0]; // drop size suffix e.g. vein-001_small -> vein-001
-  const base = baseOnly.replace(/_/g, '-');
-  return SLUG_TO_LOOKUP[base] || base;
-}
-
-
-/** Resolve multiple lookup keys into Stripe Price IDs */
-async function resolvePrices(lookupKeys) {
-  const uniq = [...new Set(lookupKeys)];
-  if (!uniq.length) return new Map();
-  const prices = await stripe.prices.list({
-    lookup_keys: uniq,
-    active: true,
-    limit: Math.max(uniq.length, 10),
-    expand: ['data.product']
-  });
-  const map = new Map();
-  for (const p of prices.data) {
-    if (p.lookup_key) map.set(p.lookup_key, p.id);
-  }
-  return map;
-}
-
-app.post(['/api/checkout','/checkout','/create-checkout-session'], async (req, res) => {
-  if (DEBUG) {
-    try { const keys = Object.keys(req.body || {}); console.log('[checkout] body keys:', keys);
-      const c = req.body && req.body.cart || []; console.log('[checkout] cart length:', c.length);
-      console.log('[checkout] origin:', req.get('origin') || ''); } catch {}
-  }
-  try {
-    const {
-      email, name, phone,
-      address1, city, postcode, country = 'GB',
-      cart = []
-    } = req.body || {};
-
-    // require a non-empty cart
-    if (!Array.isArray(cart) || cart.length === 0) {
-      console.warn('[checkout] EMPTY_CART');
-      return res.status(400).json({ error: 'EMPTY_CART' });
-    }
-
-    console.log('[checkout] origin:', req.headers.origin);
-    console.log('[checkout] body:', req.body);
-
-    const wantedLookupKeys = cart.map(itemToLookupKey);
-    const priceMap = await resolvePrices(wantedLookupKeys);
-
-    const itemsForSession = cart.map(raw => {
-      const lk = itemToLookupKey(raw);
-      const price = priceMap.get(lk);
-      if (!price) {
-        throw new Error(`NO_PRICE_FOR_LOOKUP_KEY_${lk}`);
-      }
-      const qty = Math.max(1, parseInt(raw.quantity || 1, 10));
-      return { price, quantity: qty };
-    });
-
-    const success = `${FRONTEND_BASE_URL || ''}/thankyou.html?sid={CHECKOUT_SESSION_ID}`.replace(/\/\//g,'/').replace('https:/','https://');
-    const cancel  = `${FRONTEND_BASE_URL || ''}/checkout.html`.replace(/\/\//g,'/').replace('https:/','https://');
-
-    const session = await stripe.checkout.sessions.create({
-      mode: 'payment',
-      if (DEBUG) console.log('[checkout] line_items:', JSON.stringify(itemsForSession));
-      line_items: itemsForSession,
-      allow_promotion_codes: true,
-      customer_email: email || undefined,
-      shipping_address_collection: { allowed_countries: ['GB'] },
-      success_url: success,
-      cancel_url: cancel,
-      metadata: {
-        name: name || '',
-        phone: phone || '',
-        address1: address1 || '',
-        city: city || '',
-        postcode: postcode || '',
-        country: country || 'GB'
-      }
-    });
-
-    return res.json({ url: session.url, id: session.id });
-  } catch (err) {
-    console.error('[checkout] error:', err?.message || err);
-    return res.status(400).json({ error: err?.message || 'CHECKOUT_CREATE_FAILED' });
-  }
-});
-
-// Lightweight order fetch for thankyou.html
-app.get('/api/orders/:id', async (req, res) => {
-  try {
-    const id = req.params.id;
-    const session = await stripe.checkout.sessions.retrieve(id);
-    const lineItems = await stripe.checkout.sessions.listLineItems(id, {
-      expand: ['data.price.product']
-    });
-
-    const lines = (lineItems.data || []).map(li => ({
-      quantity: li.quantity || 1,
-      amount_subtotal: li.amount_subtotal || 0,
-      amount_total: li.amount_total || 0,
-      currency: (li.currency || session.currency || 'gbp').toLowerCase(),
-      name: (li.price?.product?.name) || li.description || '',
-      size: (li.price?.nickname) || '', // optional: price nickname as size/variant
-      price: {
-        unit_amount: li.price?.unit_amount || 0,
-        currency: (li.price?.currency || session.currency || 'gbp').toLowerCase()
-      }
-    }));
-
-    return res.json({
-      id: session.id,
-      status: session.payment_status || session.status || 'created',
-      amount_total: session.amount_total || 0,
-      currency: (session.currency || 'gbp').toLowerCase(),
-      created: session.created,
-      email: session.customer_details?.email || '',
-      pricing: { lines }
-    });
-  } catch (e) {
-    console.error('[orders] fetch failed:', e?.message || e);
-    return res.status(400).json({ error: 'ORDER_LOOKUP_FAILED' });
-  }
-});
-
-// Optional helper: /session/:id -> redirect to Checkout (handy if frontend only gets an id)
-app.get('/session/:id', async (req, res) => {
-  try {
-    const s = await stripe.checkout.sessions.retrieve(req.params.id);
-    if (s && s.url) return res.redirect(s.url);
-    return res.status(404).send('Session not found');
-  } catch (e) {
-    return res.status(400).send('Invalid session');
-  }
-});
-
-// ---- Webhook ----
-app.post('/webhook', async (req, res) => {
-  const sig = req.headers['stripe-signature'];
+// Webhook must be before express.json and use raw body
+app.post("/webhook", bodyParser.raw({ type: "application/json" }), (req, res) => {
+  const sig = req.headers["stripe-signature"];
   let event;
-
   try {
-    event = stripe.webhooks.constructEvent(req.body, sig, STRIPE_WEBHOOK_SECRET || '');
+    event = stripe.webhooks.constructEvent(req.body, sig, STRIPE_WEBHOOK_SECRET);
   } catch (err) {
-    console.error('[webhook] signature verification failed:', err.message);
+    console.error("Webhook signature verification failed:", err.message);
     return res.status(400).send(`Webhook Error: ${err.message}`);
   }
 
+  switch (event.type) {
+    case "checkout.session.completed": {
+      const session = event.data.object;
+      console.log("✅ checkout.session.completed", session.id, session.mode, session.amount_total);
+      // TODO: fulfill order, email, etc.
+      break;
+    }
+    default:
+      console.log("ℹ️ Unhandled event", event.type);
+  }
+  res.json({ received: true });
+});
+
+// For non-webhook routes use JSON parser
+app.use(express.json());
+
+// Optional friendly SKU -> lookup_key mapping
+const friendlyMap = {
+  "vein-001": "host001_compression_vein001",
+  "vein001": "host001_compression_vein001",
+  "vein-002": "host001_compression_vein002",
+  "vein002": "host001_compression_vein002",
+  "obsidian-001": "host001_compression_obsidian",
+  "obsidian": "host001_compression_obsidian",
+  "corrode-001": "host001_compression_corrode",
+  "corrode": "host001_compression_corrode",
+  "skinlock-exe": "host001_compression_skinlock",
+  "skinlock": "host001_compression_skinlock",
+  "reaper-001": "host001_tee_reaper",
+  "reaper": "host001_tee_reaper",
+  "wrath-001": "host001_tee_wrath",
+  "wraith-001": "host001_tee_wrath",
+  "wrath": "host001_tee_wrath",
+  "within-001": "host001_hoodie_within",
+  "within": "host001_hoodie_within",
+  "nullvoid-001": "host001_hoodie_nullvoid",
+  "nullvoid": "host001_hoodie_nullvoid",
+};
+
+async function resolveLineItem(item) {
+  // Accepts { price }, { lookup_key }, or { sku } (mapped to lookup_key)
+  if (!item) throw new Error("Invalid item");
+  if (item.price && String(item.price).startsWith("price_")) {
+    return { price: item.price, quantity: item.quantity || 1 };
+  }
+  let lk = item.lookup_key;
+  if (!lk && item.sku && friendlyMap[item.sku]) lk = friendlyMap[item.sku];
+
+  if (!lk) throw new Error("Item needs price or lookup_key/sku");
+
+  // Search active price by lookup_key
+  const prices = await stripe.prices.search({
+    query: `lookup_key:'${lk}' AND active:'true'`,
+    limit: 1,
+  });
+  if (!prices.data.length) {
+    throw new Error(`No active Stripe price for lookup_key ${lk}`);
+  }
+  return { price: prices.data[0].id, quantity: item.quantity || 1 };
+}
+
+// Create Checkout Session
+app.post("/create-checkout-session", async (req, res) => {
   try {
-    switch (event.type) {
-      case 'checkout.session.completed': {
-        const session = event.data.object;
-        console.log('✅ checkout.session.completed', session.id);
+    const { items, success_url, cancel_url, mode = "payment", customer_email } = req.body || {};
+    if (!Array.isArray(items) || !items.length) throw new Error("Cart is empty or invalid");
 
-        // Pull details to email customer
-        const customerEmail = session.customer_details?.email || session.customer_email;
-        const amountTotal = session.amount_total;
-        const currency = session.currency;
-
-        // Optionally fetch line items (requires expand or separate API call)
-        let lineItems = [];
-        try {
-          const items = await stripe.checkout.sessions.listLineItems(session.id, { limit: 100 });
-          lineItems = items.data || [];
-        } catch (e) {
-          console.warn('[webhook] listLineItems failed:', e.message);
-        }
-
-        await sendOrderEmail({
-          to: customerEmail,
-          orderId: session.id,
-          amountTotal,
-          currency,
-          lineItems,
-          created: session.created
-        });
-
-        break;
-      }
-
-      case 'payment_intent.succeeded': {
-        const intent = event.data.object;
-        console.log('💰 payment_intent.succeeded', intent.id, intent.amount);
-        break;
-      }
-
-      case 'payment_intent.payment_failed': {
-        const intent = event.data.object;
-        console.warn('❌ payment_intent.payment_failed', intent.id, intent.last_payment_error?.message);
-        break;
-      }
-
-      case 'charge.refunded': {
-        const charge = event.data.object;
-        console.log('↩️ charge.refunded', charge.id, charge.amount_refunded);
-        break;
-      }
-
-      default:
-        break;
+    const line_items = [];
+    for (const it of items) {
+      line_items.push(await resolveLineItem(it));
     }
 
-    res.json({ received: true });
-  } catch (err) {
-    console.error('[webhook] handler error:', err);
-    res.status(500).json({ ok: false });
+    const successUrl = success_url || (FRONTEND_BASE_URL ? `${FRONTEND_BASE_URL}/thankyou.html` : undefined);
+    const cancelUrl = cancel_url || (FRONTEND_BASE_URL ? `${FRONTEND_BASE_URL}/basket.html` : undefined);
+    if (!successUrl || !cancelUrl) {
+      throw new Error("Missing success_url/cancel_url and FRONTEND_BASE_URL");
+    }
+
+    const session = await stripe.checkout.sessions.create({
+      mode,
+      line_items,
+      allow_promotion_codes: true,
+      shipping_address_collection: { allowed_countries: ["GB", "IE", "US", "CA", "AU", "NZ", "DE", "FR", "NL", "ES", "IT", "SE", "NO", "DK"] },
+      success_url: successUrl,
+      cancel_url: cancelUrl,
+      customer_email: customer_email || undefined,
+      billing_address_collection: "auto",
+      // automatic_tax: { enabled: false }, // toggle if you enable Stripe Tax
+    });
+
+    res.json({ id: session.id, url: session.url });
+  } catch (e) {
+    console.error("create-checkout-session error:", e);
+    res.status(400).json({ error: String(e.message || e) });
   }
 });
 
-// ----- Start -----
-const PORT = process.env.PORT || 8787;
-app.listen(PORT, () => {
-  console.log(`NVRBRTH server running on ${PORT}`);
+const port = process.env.PORT || 8787;
+app.listen(port, () => {
+  console.log(`NVRBRTH server listening on ${port}. Allowed origins: ${origins.join(", ")}`);
 });
