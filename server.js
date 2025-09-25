@@ -62,6 +62,22 @@ app.use(cors({
 // Healthcheck
 app.get("/ping", (_req, res) => res.json({ ok: true }));
 
+// Fallback redirect endpoint to open a session by id (used if frontend didn't get session.url)
+app.get("/session/:id", async (req, res) => {
+  try{
+    const sid = req.params.id;
+    if(!sid) return res.status(400).send("Missing session id");
+    const session = await stripe.checkout.sessions.retrieve(sid);
+    if(session && session.url){
+      return res.redirect(303, session.url);
+    }
+    return res.status(404).send("Session not found or missing URL");
+  }catch(e){
+    console.error("GET /session/:id error:", e);
+    return res.status(500).send("Internal error");
+  }
+});
+
 // Webhook must be before express.json and use raw body
 app.post("/webhook", bodyParser.raw({ type: "application/json" }), (req, res) => {
   const sig = req.headers["stripe-signature"];
@@ -166,7 +182,7 @@ app.post("/create-checkout-session", async (req, res) => {
     res.json({ id: session.id, url: session.url });
   } catch (e) {
     console.error("create-checkout-session error:", e);
-    res.status(400).json({ error: String(e.message || e) });
+    res.status(400).json({ error: String(e.message || e), code: "CREATE_SESSION_FAILED" });
   }
 });
 
